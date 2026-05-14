@@ -320,11 +320,11 @@ func parseClaudeAssistantMessage(raw json.RawMessage) (string, []string) {
 }
 
 // extractToolPaths pulls plausible file paths from tool input fields.
-// Claude's standard tools use file_path / path / pattern as their key
-// names; we cover all three.
+// Agent tools use several key names for path-like values; cover the common
+// variants here so transcript readers can share the same extraction logic.
 func extractToolPaths(input map[string]any) []string {
 	var out []string
-	for _, key := range []string{"file_path", "path", "notebook_path"} {
+	for _, key := range []string{"file_path", "filePath", "path", "notebook_path"} {
 		if s, ok := input[key].(string); ok && s != "" {
 			out = append(out, s)
 		}
