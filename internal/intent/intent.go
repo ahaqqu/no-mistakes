@@ -37,12 +37,17 @@ type ExtractParams struct {
 	// stricter multi-file and stale-partial acceptance rules.
 	Threshold float64
 	// Readers are the per-agent transcript readers to consult. Order is
-	// insignificant; matching picks the best score across all of them.
+	// insignificant; matching accepts plausible candidates, prefers a single
+	// decisive raw-score match, and otherwise ranks by confidence or an optional
+	// Disambiguator.
 	Readers []Reader
 	// Cache is consulted before summarization. Pass NewMemCache() if no DB.
 	Cache Cache
 	// Summarizer turns the chosen session's text into a short summary.
 	Summarizer Summarizer
+	// Disambiguator optionally chooses among multiple plausible sessions when
+	// file-overlap scoring is not decisive enough to pick one safely.
+	Disambiguator Disambiguator
 	// Logf receives best-effort candidate diagnostics. Nil disables logging.
 	Logf func(format string, args ...any)
 }
@@ -51,9 +56,12 @@ type ExtractParams struct {
 // should treat this as a normal "no intent attached" outcome, not an error.
 var ErrNoMatch = errors.New("intent: no matching transcript")
 
-// Extract runs the discover -> match -> cache -> summarize pipeline and
-// returns the final intent. It returns ErrNoMatch when no session satisfies
-// the matcher's threshold, overlap, and freshness acceptance rules.
+// Extract runs the discover -> match -> optional disambiguate -> cache ->
+// summarize pipeline and returns the final intent. It returns ErrNoMatch when
+// no session satisfies the matcher's threshold, overlap, and freshness
+// acceptance rules. Disambiguation failures fall back to the deterministic
+// match, except cleanup failures are returned because worktree side effects
+// may remain.
 func Extract(ctx context.Context, p ExtractParams) (*Result, error) {
 	if p.OriginCWD == "" {
 		return nil, fmt.Errorf("intent: OriginCWD is required")
@@ -127,6 +135,10 @@ func Extract(ctx context.Context, p ExtractParams) (*Result, error) {
 	if match == nil {
 		return nil, ErrNoMatch
 	}
+	match, err := disambiguateMatch(ctx, p, match, loaded)
+	if err != nil {
+		return nil, err
+	}
 
 	key := cacheKeyFor(match.Session)
 	if cached, ok := p.Cache.Get(key); ok && cached != "" {
@@ -150,6 +162,38 @@ func Extract(ctx context.Context, p ExtractParams) (*Result, error) {
 		SessionID: match.Session.SessionID,
 		Score:     match.Score,
 	}, nil
+}
+
+func disambiguateMatch(ctx context.Context, p ExtractParams, fallback *Match, loaded []*Session) (*Match, error) {
+	if p.Disambiguator == nil {
+		return fallback, nil
+	}
+	candidates := acceptedMatches(loaded, p.DiffFiles, matchOptions{
+		Threshold: p.Threshold,
+		HeadTime:  p.HeadTime,
+	})
+	if !shouldDisambiguate(candidates) {
+		return fallback, nil
+	}
+	choice, err := p.Disambiguator.Disambiguate(ctx, p.DiffFiles, candidates)
+	if err != nil {
+		if errors.Is(err, ErrDisambiguatorCleanup) {
+			return nil, fmt.Errorf("intent: disambiguator cleanup: %w", err)
+		}
+		if p.Logf != nil {
+			p.Logf("disambiguator failed: %v", err)
+		}
+		return fallback, nil
+	}
+	for _, candidate := range candidates {
+		if candidate.Session != nil && candidate.Session.AgentName == choice.AgentName && candidate.Session.SessionID == choice.SessionID {
+			return candidate, nil
+		}
+	}
+	if p.Logf != nil {
+		p.Logf("disambiguator returned unknown session %q/%q", choice.AgentName, choice.SessionID)
+	}
+	return fallback, nil
 }
 
 func maxInt(a, b int) int {

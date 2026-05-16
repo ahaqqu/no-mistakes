@@ -25,7 +25,8 @@ const intentExtractTimeout = 30 * time.Second
 // steps can surface it in their prompts. Failures are intentionally
 // swallowed and surface as a "skipped" outcome rather than a run failure:
 // missing transcripts, slow summarizers, or DB hiccups must not block
-// the pipeline.
+// the pipeline. Disambiguator cleanup failures are fatal because they may leave
+// worktree side effects that could affect later steps.
 type IntentStep struct {
 	// runIntent computes the intent for a step context. It is overridden
 	// in tests; the zero value falls back to defaultRunIntent which wires
@@ -99,6 +100,11 @@ func (s *IntentStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.Step
 			outcomeLabel = "empty_diff"
 			sctx.Log("no diff between base and head, skipping intent extraction")
 			return &pipeline.StepOutcome{Skipped: true}, nil
+		}
+		if errors.Is(runErr, intent.ErrDisambiguatorCleanup) {
+			outcomeLabel = "error"
+			sctx.Log(fmt.Sprintf("intent extraction failed: %v", runErr))
+			return nil, runErr
 		}
 		slog.Debug("intent: extract failed", "run_id", sctx.Run.ID, "error", runErr)
 		outcomeLabel = "error"
@@ -192,15 +198,16 @@ func defaultRunIntent(ctx context.Context, sctx *pipeline.StepContext) (*intent.
 	}
 
 	return intent.Extract(ctx, intent.ExtractParams{
-		OriginCWD:  repo.WorkingPath,
-		DiffFiles:  diffFiles,
-		BaseTime:   baseTime,
-		HeadTime:   headTime,
-		SlackDays:  cfg.Intent.SlackDays,
-		Threshold:  cfg.Intent.Threshold,
-		Readers:    intent.AllReaders(cfg.Intent.DisabledReaders),
-		Cache:      intent.NewDBCache(sctx.DB),
-		Summarizer: intent.NewAgentSummarizer(sctx.Agent, sctx.WorkDir),
+		OriginCWD:     repo.WorkingPath,
+		DiffFiles:     diffFiles,
+		BaseTime:      baseTime,
+		HeadTime:      headTime,
+		SlackDays:     cfg.Intent.SlackDays,
+		Threshold:     cfg.Intent.Threshold,
+		Readers:       intent.AllReaders(cfg.Intent.DisabledReaders),
+		Cache:         intent.NewDBCache(sctx.DB),
+		Summarizer:    intent.NewAgentSummarizer(sctx.Agent, sctx.WorkDir),
+		Disambiguator: intent.NewAgentDisambiguator(sctx.Agent, sctx.WorkDir),
 		Logf: func(format string, args ...any) {
 			sctx.Log(fmt.Sprintf("intent "+format, args...))
 		},

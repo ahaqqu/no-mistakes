@@ -33,6 +33,23 @@ func (f *fixedSummarizer) Summarize(_ context.Context, _ *Session) (string, erro
 	return f.summary, nil
 }
 
+type fixedDisambiguator struct {
+	selectedAgentName string
+	selectedSessionID string
+	calls             int
+	candidates        []*Match
+	err               error
+}
+
+func (f *fixedDisambiguator) Disambiguate(_ context.Context, _ []string, candidates []*Match) (DisambiguationChoice, error) {
+	f.calls++
+	f.candidates = candidates
+	if f.err != nil {
+		return DisambiguationChoice{}, f.err
+	}
+	return DisambiguationChoice{AgentName: f.selectedAgentName, SessionID: f.selectedSessionID}, nil
+}
+
 func TestExtract_HappyPath(t *testing.T) {
 	r := &staticReader{
 		name: "claude",
@@ -155,6 +172,221 @@ func TestExtract_CacheHitSkipsSummarizer(t *testing.T) {
 	}
 	if sum.calls != 0 {
 		t.Errorf("summarizer should not have been called, got %d calls", sum.calls)
+	}
+}
+
+func TestExtract_DisambiguatesWhenMultipleAcceptedCandidatesAreNotDecisive(t *testing.T) {
+	first := &Session{
+		SessionID:    "s1",
+		LastActivity: time.Now(),
+		LastMsgKey:   "k1",
+		Messages:     []Message{{Role: RoleUser, Text: "work on foo and bar", FilePaths: []string{"foo.go", "bar.go"}}},
+	}
+	second := &Session{
+		SessionID:    "s2",
+		LastActivity: time.Now().Add(-time.Minute),
+		LastMsgKey:   "k2",
+		Messages:     []Message{{Role: RoleUser, Text: "work on bar and baz", FilePaths: []string{"bar.go", "baz.go"}}},
+	}
+	r := &staticReader{name: "claude", sessions: []*Session{first, second}}
+	d := &fixedDisambiguator{selectedAgentName: "claude", selectedSessionID: "s2"}
+
+	got, err := Extract(context.Background(), ExtractParams{
+		OriginCWD:     "/tmp/repo",
+		DiffFiles:     []string{"foo.go", "bar.go", "baz.go", "qux.go"},
+		HeadTime:      time.Now(),
+		BaseTime:      time.Now().Add(-time.Hour),
+		Threshold:     0.2,
+		Readers:       []Reader{r},
+		Summarizer:    &fixedSummarizer{summary: "selected second"},
+		Disambiguator: d,
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if d.calls != 1 {
+		t.Fatalf("disambiguator calls = %d, want 1", d.calls)
+	}
+	if len(d.candidates) != 2 {
+		t.Fatalf("disambiguator candidates = %d, want 2", len(d.candidates))
+	}
+	if got.SessionID != "s2" {
+		t.Fatalf("selected session = %q, want s2", got.SessionID)
+	}
+}
+
+func TestExtract_DoesNotDisambiguateSingleDecisiveCandidate(t *testing.T) {
+	decisive := &Session{
+		SessionID:    "decisive",
+		LastActivity: time.Now().Add(-time.Minute),
+		Messages:     []Message{{Role: RoleUser, FilePaths: []string{"foo.go", "bar.go", "baz.go", "qux.go"}}},
+	}
+	partial := &Session{
+		SessionID:    "partial",
+		LastActivity: time.Now(),
+		Messages:     []Message{{Role: RoleUser, FilePaths: []string{"foo.go", "bar.go"}}},
+	}
+	r := &staticReader{name: "claude", sessions: []*Session{partial, decisive}}
+	d := &fixedDisambiguator{selectedAgentName: "claude", selectedSessionID: "partial"}
+
+	got, err := Extract(context.Background(), ExtractParams{
+		OriginCWD:     "/tmp/repo",
+		DiffFiles:     []string{"foo.go", "bar.go", "baz.go", "qux.go"},
+		HeadTime:      time.Now(),
+		BaseTime:      time.Now().Add(-time.Hour),
+		Threshold:     0.2,
+		Readers:       []Reader{r},
+		Summarizer:    &fixedSummarizer{summary: "selected decisive"},
+		Disambiguator: d,
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if d.calls != 0 {
+		t.Fatalf("disambiguator calls = %d, want 0", d.calls)
+	}
+	if got.SessionID != "decisive" {
+		t.Fatalf("selected session = %q, want decisive", got.SessionID)
+	}
+}
+
+func TestExtract_DisambiguatesWhenMultipleCandidatesAreDecisive(t *testing.T) {
+	first := &Session{
+		SessionID:    "s1",
+		LastActivity: time.Now(),
+		Messages:     []Message{{Role: RoleUser, FilePaths: []string{"foo.go", "bar.go", "baz.go", "qux.go"}}},
+	}
+	second := &Session{
+		SessionID:    "s2",
+		LastActivity: time.Now().Add(-time.Minute),
+		Messages:     []Message{{Role: RoleUser, FilePaths: []string{"foo.go", "bar.go", "baz.go", "qux.go"}}},
+	}
+	r := &staticReader{name: "claude", sessions: []*Session{first, second}}
+	d := &fixedDisambiguator{selectedAgentName: "claude", selectedSessionID: "s2"}
+
+	got, err := Extract(context.Background(), ExtractParams{
+		OriginCWD:     "/tmp/repo",
+		DiffFiles:     []string{"foo.go", "bar.go", "baz.go", "qux.go"},
+		HeadTime:      time.Now(),
+		BaseTime:      time.Now().Add(-time.Hour),
+		Threshold:     0.2,
+		Readers:       []Reader{r},
+		Summarizer:    &fixedSummarizer{summary: "selected second"},
+		Disambiguator: d,
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if d.calls != 1 {
+		t.Fatalf("disambiguator calls = %d, want 1", d.calls)
+	}
+	if got.SessionID != "s2" {
+		t.Fatalf("selected session = %q, want s2", got.SessionID)
+	}
+}
+
+func TestExtract_DisambiguatorSelectionUsesAgentNameAndSessionID(t *testing.T) {
+	headTime := time.Now()
+	claude := &staticReader{name: "claude", sessions: []*Session{{
+		SessionID:    "same",
+		LastActivity: headTime.Add(-time.Minute),
+		Messages:     []Message{{Role: RoleUser, FilePaths: []string{"foo.go", "bar.go"}}},
+	}}}
+	opencode := &staticReader{name: "opencode", sessions: []*Session{{
+		SessionID:    "same",
+		LastActivity: headTime,
+		Messages:     []Message{{Role: RoleUser, FilePaths: []string{"foo.go", "bar.go"}}},
+	}}}
+	d := &fixedDisambiguator{selectedAgentName: "opencode", selectedSessionID: "same"}
+
+	got, err := Extract(context.Background(), ExtractParams{
+		OriginCWD:     "/tmp/repo",
+		DiffFiles:     []string{"foo.go", "bar.go"},
+		HeadTime:      headTime,
+		BaseTime:      headTime.Add(-time.Hour),
+		Threshold:     0.2,
+		Readers:       []Reader{claude, opencode},
+		Summarizer:    &fixedSummarizer{summary: "selected opencode"},
+		Disambiguator: d,
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.AgentName != "opencode" || got.SessionID != "same" {
+		t.Fatalf("selected = %s/%s, want opencode/same", got.AgentName, got.SessionID)
+	}
+}
+
+func TestExtract_ReturnsErrorWhenDisambiguatorCleanupFails(t *testing.T) {
+	headTime := time.Now()
+	r := &staticReader{name: "claude", sessions: []*Session{
+		{
+			SessionID:    "s1",
+			LastActivity: headTime,
+			Messages:     []Message{{Role: RoleUser, FilePaths: []string{"foo.go", "bar.go"}}},
+		},
+		{
+			SessionID:    "s2",
+			LastActivity: headTime.Add(-time.Minute),
+			Messages:     []Message{{Role: RoleUser, FilePaths: []string{"foo.go", "bar.go"}}},
+		},
+	}}
+	d := &fixedDisambiguator{err: ErrDisambiguatorCleanup}
+
+	_, err := Extract(context.Background(), ExtractParams{
+		OriginCWD:     "/tmp/repo",
+		DiffFiles:     []string{"foo.go", "bar.go"},
+		HeadTime:      headTime,
+		BaseTime:      headTime.Add(-time.Hour),
+		Threshold:     0.2,
+		Readers:       []Reader{r},
+		Summarizer:    &fixedSummarizer{summary: "fallback"},
+		Disambiguator: d,
+	})
+	if !errors.Is(err, ErrDisambiguatorCleanup) {
+		t.Fatalf("error = %v, want ErrDisambiguatorCleanup", err)
+	}
+}
+
+func TestExtract_SingleDecisiveCandidateBeatsRecentPartialMatch(t *testing.T) {
+	headTime := time.Now()
+	diffFiles := []string{
+		"a.go", "b.go", "c.go", "d.go", "e.go",
+		"f.go", "g.go", "h.go", "i.go", "j.go",
+		"k.go", "l.go", "m.go", "n.go", "o.go",
+		"p.go", "q.go", "r.go", "s.go", "t.go",
+	}
+	decisive := &Session{
+		SessionID:    "decisive",
+		LastActivity: headTime.Add(-3 * time.Hour),
+		Messages:     []Message{{Role: RoleUser, FilePaths: diffFiles[:17]}},
+	}
+	recentPartial := &Session{
+		SessionID:    "recent-partial",
+		LastActivity: headTime,
+		Messages:     []Message{{Role: RoleUser, FilePaths: diffFiles[:16]}},
+	}
+	r := &staticReader{name: "claude", sessions: []*Session{recentPartial, decisive}}
+	d := &fixedDisambiguator{selectedAgentName: "claude", selectedSessionID: "recent-partial"}
+
+	got, err := Extract(context.Background(), ExtractParams{
+		OriginCWD:     "/tmp/repo",
+		DiffFiles:     diffFiles,
+		HeadTime:      headTime,
+		BaseTime:      headTime.Add(-time.Hour),
+		Threshold:     0.2,
+		Readers:       []Reader{r},
+		Summarizer:    &fixedSummarizer{summary: "selected decisive"},
+		Disambiguator: d,
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if d.calls != 0 {
+		t.Fatalf("disambiguator calls = %d, want 0", d.calls)
+	}
+	if got.SessionID != "decisive" {
+		t.Fatalf("selected session = %q, want decisive", got.SessionID)
 	}
 }
 
