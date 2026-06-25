@@ -39,13 +39,14 @@ const (
 
 // GlobalConfig represents ~/.no-mistakes/config.yaml.
 type GlobalConfig struct {
-	Agent                types.AgentName     `yaml:"agent"`
-	ACPXPath             string              `yaml:"acpx_path"`
-	ACPRegistryOverrides map[string]string   `yaml:"acp_registry_overrides"`
-	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
-	AgentArgsOverride    map[string][]string `yaml:"agent_args_override"`
-	CITimeout            time.Duration       `yaml:"-"`
-	LogLevel             string              `yaml:"log_level"`
+	Agent                types.AgentName              `yaml:"agent"`
+	ACPXPath             string                       `yaml:"acpx_path"`
+	ACPRegistryOverrides map[string]string            `yaml:"acp_registry_overrides"`
+	AgentPathOverride    map[string]string            `yaml:"agent_path_override"`
+	AgentArgsOverride    map[string][]string          `yaml:"agent_args_override"`
+	AgentModel           map[string]map[string]string `yaml:"agent_model"`
+	CITimeout            time.Duration                `yaml:"-"`
+	LogLevel             string                       `yaml:"log_level"`
 	AutoFix              AutoFixRaw
 	Intent               IntentRaw
 	Test                 TestRaw
@@ -53,24 +54,26 @@ type GlobalConfig struct {
 
 // globalConfigRaw is the on-disk YAML representation with duration as string.
 type globalConfigRaw struct {
-	Agent                types.AgentName     `yaml:"agent"`
-	ACPXPath             string              `yaml:"acpx_path"`
-	ACPRegistryOverrides map[string]string   `yaml:"acp_registry_overrides"`
-	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
-	AgentArgsOverride    map[string][]string `yaml:"agent_args_override"`
-	CITimeout            string              `yaml:"ci_timeout"`
-	BabysitTimeout       string              `yaml:"babysit_timeout"`
-	LogLevel             string              `yaml:"log_level"`
-	AutoFix              AutoFixRaw          `yaml:"auto_fix"`
-	Intent               IntentRaw           `yaml:"intent"`
-	Test                 TestRaw             `yaml:"test"`
+	Agent                types.AgentName              `yaml:"agent"`
+	ACPXPath             string                       `yaml:"acpx_path"`
+	ACPRegistryOverrides map[string]string            `yaml:"acp_registry_overrides"`
+	AgentPathOverride    map[string]string            `yaml:"agent_path_override"`
+	AgentArgsOverride    map[string][]string          `yaml:"agent_args_override"`
+	AgentModel           map[string]map[string]string `yaml:"agent_model"`
+	CITimeout            string                       `yaml:"ci_timeout"`
+	BabysitTimeout       string                       `yaml:"babysit_timeout"`
+	LogLevel             string                       `yaml:"log_level"`
+	AutoFix              AutoFixRaw                   `yaml:"auto_fix"`
+	Intent               IntentRaw                    `yaml:"intent"`
+	Test                 TestRaw                      `yaml:"test"`
 }
 
 // RepoConfig represents .no-mistakes.yaml in a repo root.
 type RepoConfig struct {
-	Agent          types.AgentName `yaml:"agent"`
-	Commands       Commands        `yaml:"commands"`
-	IgnorePatterns []string        `yaml:"ignore_patterns"`
+	Agent          types.AgentName              `yaml:"agent"`
+	AgentModel     map[string]map[string]string `yaml:"agent_model"`
+	Commands       Commands                     `yaml:"commands"`
+	IgnorePatterns []string                     `yaml:"ignore_patterns"`
 	// AllowRepoCommands opts in to honoring the code-executing selection
 	// fields (commands.{test,lint,format} and agent) from a contributor's
 	// pushed branch instead of the trusted default-branch copy. It is read
@@ -120,6 +123,7 @@ type Config struct {
 	ACPRegistryOverrides map[string]string
 	AgentPathOverride    map[string]string
 	AgentArgsOverride    map[string][]string
+	AgentModel           map[string]map[string]string
 	CITimeout            time.Duration
 	LogLevel             string
 	Commands             Commands
@@ -495,6 +499,9 @@ func LoadGlobal(path string) (*GlobalConfig, error) {
 		}
 		cfg.AgentArgsOverride = raw.AgentArgsOverride
 	}
+	if raw.AgentModel != nil {
+		cfg.AgentModel = raw.AgentModel
+	}
 	timeoutValue := raw.CITimeout
 	if timeoutValue == "" {
 		timeoutValue = raw.BabysitTimeout
@@ -759,6 +766,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		ACPRegistryOverrides: global.ACPRegistryOverrides,
 		AgentPathOverride:    global.AgentPathOverride,
 		AgentArgsOverride:    global.AgentArgsOverride,
+		AgentModel:           mergeAgentModel(global.AgentModel, repo.AgentModel),
 		CITimeout:            global.CITimeout,
 		LogLevel:             global.LogLevel,
 		Commands:             repo.Commands,
@@ -773,4 +781,37 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 	}
 
 	return cfg
+}
+
+// mergeAgentModel merges repo agent_model over global. Repo entries override
+// global at the per-agent-per-step granularity.
+func mergeAgentModel(global, repo map[string]map[string]string) map[string]map[string]string {
+	if repo == nil {
+		return global
+	}
+	if global == nil {
+		return repo
+	}
+	out := make(map[string]map[string]string, len(global))
+	for agentKey, steps := range global {
+		stepCopy := make(map[string]string, len(steps))
+		for k, v := range steps {
+			stepCopy[k] = v
+		}
+		out[agentKey] = stepCopy
+	}
+	for agentKey, steps := range repo {
+		if existing, ok := out[agentKey]; ok {
+			for stepKey, model := range steps {
+				existing[stepKey] = model
+			}
+		} else {
+			stepCopy := make(map[string]string, len(steps))
+			for k, v := range steps {
+				stepCopy[k] = v
+			}
+			out[agentKey] = stepCopy
+		}
+	}
+	return out
 }

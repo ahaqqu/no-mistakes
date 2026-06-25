@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -408,6 +409,182 @@ func TestOpencodeAgent_NoSchema(t *testing.T) {
 }
 
 // TestOpencodeAgent_FinalAnswerPreferred tests that final_answer phase text is preferred.
+// TestOpencodeAgent_RequestBodyShape verifies the POST /session/{id}/message
+// body uses info.format (not root format), omits retryCount, and sets
+// info.model when RunOpts.Model is non-empty.
+func TestOpencodeAgent_RequestBodyShape(t *testing.T) {
+	t.Run("schema sets info.format, no root format", func(t *testing.T) {
+		var requestBody []byte
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/session/test-session-456/message" && r.Method == http.MethodPost {
+				var err error
+				requestBody, err = io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatalf("failed to read request body: %v", err)
+				}
+			}
+			switch {
+			case r.URL.Path == "/session" && r.Method == http.MethodPost:
+				fmt.Fprint(w, `{"id":"test-session-456"}`)
+			case r.URL.Path == "/global/event" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, "data: {\"payload\":{\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"test-session-456\",\"field\":\"text\",\"partID\":\"p1\",\"delta\":\"ok\"}}}\n\n")
+				fmt.Fprint(w, "data: {\"payload\":{\"type\":\"session.idle\"}}\n\n")
+			case r.URL.Path == "/session/test-session-456/message" && r.Method == http.MethodPost:
+				fmt.Fprint(w, `{"info":{"id":"msg1","role":"assistant","structured":{"ok":true}},"parts":[{"type":"text","text":"ok"}]}`)
+			case r.URL.Path == "/session/test-session-456" && r.Method == http.MethodDelete:
+				w.WriteHeader(http.StatusOK)
+			default:
+				w.WriteHeader(http.StatusOK)
+			}
+		}))
+		defer server.Close()
+
+		a := &opencodeAgent{
+			bin:    "opencode",
+			server: &managedServer{port: mustParsePort(server.URL)},
+		}
+		_, err := a.Run(context.Background(), RunOpts{
+			Prompt:     "test",
+			CWD:        t.TempDir(),
+			JSONSchema: json.RawMessage(`{"type":"object"}`),
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var body map[string]any
+		if err := json.Unmarshal(requestBody, &body); err != nil {
+			t.Fatalf("failed to parse request body: %v", err)
+		}
+
+		// info.format must exist
+		info, ok := body["info"].(map[string]any)
+		if !ok {
+			t.Fatal("expected body.info to be present")
+		}
+		format, ok := info["format"].(map[string]any)
+		if !ok {
+			t.Fatal("expected body.info.format to be present")
+		}
+		if format["type"] != "json_schema" {
+			t.Errorf("expected format.type = json_schema, got %v", format["type"])
+		}
+		// retryCount must NOT be present
+		if _, ok := format["retryCount"]; ok {
+			t.Error("retryCount should not be present in format")
+		}
+		// root format must NOT be present
+		if _, ok := body["format"]; ok {
+			t.Error("root body.format should not be present")
+		}
+	})
+
+	t.Run("model sets info.model", func(t *testing.T) {
+		var requestBody []byte
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/session/test-session-789/message" && r.Method == http.MethodPost {
+				var err error
+				requestBody, err = io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatalf("failed to read request body: %v", err)
+				}
+			}
+			switch {
+			case r.URL.Path == "/session" && r.Method == http.MethodPost:
+				fmt.Fprint(w, `{"id":"test-session-789"}`)
+			case r.URL.Path == "/global/event" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, "data: {\"payload\":{\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"test-session-789\",\"field\":\"text\",\"partID\":\"p1\",\"delta\":\"done\"}}}\n\n")
+				fmt.Fprint(w, "data: {\"payload\":{\"type\":\"session.idle\"}}\n\n")
+			case r.URL.Path == "/session/test-session-789/message" && r.Method == http.MethodPost:
+				fmt.Fprint(w, `{"info":{"id":"msg1","role":"assistant"},"parts":[{"type":"text","text":"done"}]}`)
+			case r.URL.Path == "/session/test-session-789" && r.Method == http.MethodDelete:
+				w.WriteHeader(http.StatusOK)
+			default:
+				w.WriteHeader(http.StatusOK)
+			}
+		}))
+		defer server.Close()
+
+		a := &opencodeAgent{
+			bin:    "opencode",
+			server: &managedServer{port: mustParsePort(server.URL)},
+		}
+		_, err := a.Run(context.Background(), RunOpts{
+			Prompt: "test",
+			CWD:    t.TempDir(),
+			Model:  "github-copilot/claude-sonnet-4.6",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var body map[string]any
+		if err := json.Unmarshal(requestBody, &body); err != nil {
+			t.Fatalf("failed to parse request body: %v", err)
+		}
+		info, ok := body["info"].(map[string]any)
+		if !ok {
+			t.Fatal("expected body.info to be present")
+		}
+		if info["model"] != "github-copilot/claude-sonnet-4.6" {
+			t.Errorf("expected info.model = %q, got %v", "github-copilot/claude-sonnet-4.6", info["model"])
+		}
+	})
+
+	t.Run("no schema, no model: no info field", func(t *testing.T) {
+		var requestBody []byte
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/session/s1/message" && r.Method == http.MethodPost {
+				var err error
+				requestBody, err = io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatalf("failed to read request body: %v", err)
+				}
+			}
+			switch {
+			case r.URL.Path == "/session" && r.Method == http.MethodPost:
+				fmt.Fprint(w, `{"id":"s1"}`)
+			case r.URL.Path == "/global/event" && r.Method == http.MethodGet:
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, "data: {\"payload\":{\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"s1\",\"field\":\"text\",\"partID\":\"p1\",\"delta\":\"ok\"}}}\n\n")
+				fmt.Fprint(w, "data: {\"payload\":{\"type\":\"session.idle\"}}\n\n")
+			case r.URL.Path == "/session/s1/message" && r.Method == http.MethodPost:
+				fmt.Fprint(w, `{"info":{"id":"msg1","role":"assistant"},"parts":[{"type":"text","text":"ok"}]}`)
+			case r.URL.Path == "/session/s1" && r.Method == http.MethodDelete:
+				w.WriteHeader(http.StatusOK)
+			default:
+				w.WriteHeader(http.StatusOK)
+			}
+		}))
+		defer server.Close()
+
+		a := &opencodeAgent{
+			bin:    "opencode",
+			server: &managedServer{port: mustParsePort(server.URL)},
+		}
+		_, err := a.Run(context.Background(), RunOpts{
+			Prompt: "hello",
+			CWD:    t.TempDir(),
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var body map[string]any
+		if err := json.Unmarshal(requestBody, &body); err != nil {
+			t.Fatalf("failed to parse request body: %v", err)
+		}
+		if _, ok := body["info"]; ok {
+			t.Error("body.info should not be present when neither schema nor model are set")
+		}
+	})
+}
+
 func TestOpencodeAgent_FinalAnswerPreferred(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {

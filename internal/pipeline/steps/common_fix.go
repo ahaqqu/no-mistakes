@@ -19,6 +19,7 @@ type fixExecutionOptions struct {
 	Prompt                  string
 	ErrorPrefix             string
 	FallbackSummary         string
+	Model                   string
 	AfterAgentRun           func(*agent.Result) error
 }
 
@@ -116,6 +117,7 @@ func executeFixMode(sctx *pipeline.StepContext, stepName types.StepName, opts fi
 		CWD:        sctx.WorkDir,
 		JSONSchema: commitSummarySchema,
 		OnChunk:    sctx.LogChunk,
+		Model:      opts.Model,
 	})
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", opts.ErrorPrefix, err)
