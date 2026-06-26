@@ -51,6 +51,16 @@ func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	if err := git.FetchRemoteBranch(ctx, sctx.WorkDir, "origin", defaultBranch); err != nil {
 		sctx.LogFile(fmt.Sprintf("warning: could not fetch origin/%s: %v", defaultBranch, err))
 	}
+	// Sync the push branch's remote-tracking ref only when we are about to rebase
+	// onto it (a normal push). On a force push we deliberately skip both the fetch
+	// and the rebase: the pushed commit is authoritative, and the remote-tracking
+	// ref must keep pointing at the head we last *observed* rather than the live
+	// tip. The push step uses that tracking ref as its force-with-lease anchor;
+	// if we refreshed it here, the anchor would equal the live remote head and the
+	// lease's "remote unchanged since we last saw it" fast path would pass even
+	// when the remote carries an out-of-band commit - silently clobbering it
+	// (the original #281/#305 hazard, in the force-push path). Leaving it stale is
+	// what lets the push step's content check catch that case.
 	if !forcePush && branch != "" && branch != defaultBranch {
 		if pushRemote == "origin" {
 			if err := git.FetchRemoteBranch(ctx, sctx.WorkDir, "origin", branch); err != nil {
@@ -59,6 +69,15 @@ func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 		} else if err := git.FetchRemoteBranchToRef(ctx, sctx.WorkDir, pushRemote, branch, branchTarget); err != nil {
 			sctx.LogFile(fmt.Sprintf("warning: could not fetch %s: %v", branchTarget, err))
 		}
+	}
+
+	// Stop before rebasing when the gated branch carries commits that live on
+	// the contributor's local default branch but were never pushed to
+	// origin/<default>. Rebasing onto the fresh remote default keeps those
+	// commits in the branch's history, so the PR would silently bundle another
+	// workstream's unpushed work. Surface it for a human decision instead.
+	if outcome := detectBundledLocalDefaultCommits(ctx, sctx, branch, defaultBranch); outcome != nil {
+		return outcome, nil
 	}
 	if forcePush && branch == defaultBranch && remoteDefaultBranchAdvanced(ctx, sctx.WorkDir, defaultBranch, sctx.Run.BaseSHA) {
 		findingsJSON, _ := json.Marshal(Findings{
@@ -147,6 +166,93 @@ func forcePushRebaseTargets(branch, defaultBranch string) []string {
 		return nil
 	}
 	return []string{"origin/" + defaultBranch}
+}
+
+// detectBundledLocalDefaultCommits returns a blocking finding when the gated
+// branch carries commits that exist on the contributor's local default branch
+// but were never pushed to origin/<default>. In multi-session / monorepo setups
+// the local default branch routinely carries another workstream's unpushed
+// work; branching a fix off that local tip silently drags it into the PR when
+// the branch is rebased onto the remote default. Returns nil when no such
+// divergence is detected so the run proceeds normally.
+//
+// It only flags commits the branch actually carries: it reads the local default
+// tip from the working repo, confirms that tip is ahead of origin/<default> and
+// is an ancestor of the branch HEAD, then enumerates the unpushed commits.
+// Detection is best-effort - if the local default tip advanced past the branch
+// point, or the working repo cannot be read, it returns nil rather than guess.
+func detectBundledLocalDefaultCommits(ctx context.Context, sctx *pipeline.StepContext, branch, defaultBranch string) *pipeline.StepOutcome {
+	if branch == "" || branch == defaultBranch {
+		return nil
+	}
+	workingPath := strings.TrimSpace(sctx.Repo.WorkingPath)
+	if workingPath == "" {
+		return nil
+	}
+	localTip, err := git.Run(ctx, workingPath, "rev-parse", "--verify", "--quiet", "refs/heads/"+defaultBranch+"^{commit}")
+	if err != nil {
+		return nil
+	}
+	localTip = strings.TrimSpace(localTip)
+	if localTip == "" {
+		return nil
+	}
+	remoteRef := "origin/" + defaultBranch
+	if _, err := git.Run(ctx, sctx.WorkDir, "rev-parse", "--verify", "--quiet", remoteRef+"^{commit}"); err != nil {
+		return nil
+	}
+	// The local default tip must be present in the gate's object store (it is
+	// when the branch carries it as an ancestor) for the reachability checks.
+	if _, err := git.Run(ctx, sctx.WorkDir, "rev-parse", "--verify", "--quiet", localTip+"^{commit}"); err != nil {
+		return nil
+	}
+	// Already pushed (local default not ahead of remote) -> nothing bundled.
+	if isAncestor(ctx, sctx.WorkDir, localTip, remoteRef) {
+		return nil
+	}
+	// The branch must actually carry the local default tip's commits.
+	if !isAncestor(ctx, sctx.WorkDir, localTip, "HEAD") {
+		return nil
+	}
+
+	subjects, err := git.Run(ctx, sctx.WorkDir, "log", "--oneline", "--no-decorate", remoteRef+".."+localTip)
+	if err != nil || strings.TrimSpace(subjects) == "" {
+		return nil
+	}
+	commits := strings.Split(strings.TrimSpace(subjects), "\n")
+	files, _ := git.DiffNameOnly(ctx, sctx.WorkDir, remoteRef, localTip)
+	firstFile := ""
+	if len(files) > 0 {
+		firstFile = files[0]
+	}
+
+	description := fmt.Sprintf(
+		"branch carries %d commit(s) that exist on your local %s branch but were never pushed to origin/%s; rebasing would bundle this unrelated work (%d file(s)) into the PR:\n- %s\n\nPush %s to origin, or rebase your branch onto origin/%s, before gating.",
+		len(commits), defaultBranch, defaultBranch, len(files), strings.Join(commits, "\n- "), defaultBranch, defaultBranch,
+	)
+	findingsJSON, _ := json.Marshal(Findings{
+		Items: []Finding{{
+			Severity:    "warning",
+			File:        firstFile,
+			Description: description,
+			// Bundling another workstream's unpushed commits is a workflow call
+			// the contributor must make (push <default>, rebase, or proceed); the
+			// pipeline cannot safely auto-resolve it. Mark it ask-user so the gate
+			// classifies it correctly and the driving agent escalates.
+			Action: types.ActionAskUser,
+		}},
+		Summary: fmt.Sprintf("branch bundles %d unpushed %s commit(s)", len(commits), defaultBranch),
+	})
+	return &pipeline.StepOutcome{
+		NeedsApproval: true,
+		AutoFixable:   false,
+		Findings:      string(findingsJSON),
+	}
+}
+
+func isAncestor(ctx context.Context, workDir, ancestor, descendant string) bool {
+	_, err := git.Run(ctx, workDir, "merge-base", "--is-ancestor", ancestor, descendant)
+	return err == nil
 }
 
 func remoteDefaultBranchAdvanced(ctx context.Context, workDir, defaultBranch, baseSHA string) bool {

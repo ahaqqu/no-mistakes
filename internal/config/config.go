@@ -180,7 +180,7 @@ type Intent struct {
 const defaultConfigYAML = `# no-mistakes global configuration
 
 # Agent to use for code generation
-# Options: auto, claude, codex, rovodev, opencode, pi, acp:<target>
+# Options: auto, claude, codex, rovodev, opencode, pi, copilot, acp:<target>
 # "auto" detects the first available native agent on your system
 # Use acp:<target> to run an optional user-installed acpx target, for example acp:gemini
 agent: auto
@@ -226,10 +226,10 @@ auto_fix:
   ci: 3
 
 # User-intent extraction. When you push a branch, no-mistakes can read recent
-# transcripts from your local agent (Claude Code, Codex, OpenCode, Rovo Dev, Pi),
-# pick the session that produced the change, summarize the user intent, and
-# feed it to review, test, document, lint, and PR agents so they understand
-# what you were trying to do - not just the diff.
+# transcripts from your local agent (Claude Code, Codex, OpenCode, Rovo Dev, Pi,
+# Copilot CLI), pick the session that produced the change, summarize the user
+# intent, and feed it to review, test, document, lint, and PR agents so they
+# understand what you were trying to do - not just the diff.
 intent:
   enabled: true
   threshold: 0.2
@@ -254,6 +254,7 @@ var defaultBinary = map[types.AgentName]string{
 	types.AgentRovoDev:  "acli",
 	types.AgentOpenCode: "opencode",
 	types.AgentPi:       "pi",
+	types.AgentCopilot:  "copilot",
 }
 
 // agentProbeOrder is the priority order for auto-detecting agents.
@@ -263,6 +264,7 @@ var agentProbeOrder = []types.AgentName{
 	types.AgentOpenCode,
 	types.AgentRovoDev,
 	types.AgentPi,
+	types.AgentCopilot,
 }
 
 func isACPAgent(name types.AgentName) bool {
@@ -380,6 +382,7 @@ var agentArgsOverrideAgents = map[string]bool{
 	string(types.AgentRovoDev):  true,
 	string(types.AgentOpenCode): true,
 	string(types.AgentPi):       true,
+	string(types.AgentCopilot):  true,
 }
 
 // reservedAgentArgs lists flags that no-mistakes manages internally and that
@@ -413,6 +416,12 @@ var reservedAgentArgs = map[string]map[string]bool{
 		"--mode":       true,
 		"--no-session": true,
 	},
+	string(types.AgentCopilot): {
+		"-p":              true,
+		"--prompt":        true,
+		"--output-format": true,
+		"--no-color":      true,
+	},
 }
 
 // validateAgentArgsOverride ensures each agent key is a known agent name and
@@ -421,7 +430,7 @@ var reservedAgentArgs = map[string]map[string]bool{
 func validateAgentArgsOverride(override map[string][]string) error {
 	for name, args := range override {
 		if !agentArgsOverrideAgents[name] {
-			return fmt.Errorf("invalid agent name in agent_args_override: %q (valid: claude, codex, rovodev, opencode, pi)", name)
+			return fmt.Errorf("invalid agent name in agent_args_override: %q (valid: claude, codex, rovodev, opencode, pi, copilot)", name)
 		}
 		reserved := reservedAgentArgs[name]
 		for i, arg := range args {

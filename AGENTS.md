@@ -53,7 +53,7 @@ Safest local verification sequence after non-trivial changes:
 - `internal/cli`: cobra commands and CLI wiring
 - `internal/daemon`: background daemon and run management
 - `internal/pipeline` and `internal/pipeline/steps`: orchestration plus review/test/lint/push/PR/CI steps
-- `internal/agent`: Claude, Codex, Rovo Dev, OpenCode, Pi, and ACP/acpx integrations
+- `internal/agent`: Claude, Codex, Rovo Dev, OpenCode, Pi, Copilot, and ACP/acpx integrations
 - `internal/git`, `internal/ipc`, `internal/config`, `internal/db`, `internal/paths`, `internal/types`: shared infrastructure
 - `internal/tui`: terminal UI
 
@@ -88,7 +88,7 @@ Safest local verification sequence after non-trivial changes:
   agent-spawned git/build/editor), keep running, and hold the worktree locked so
   the next run on the same branch cannot proceed. Applied to the step shell
   runner (`runShellCommandWithEnv`) and the native agent `runOnce` builders
-  (claude, codex, pi, acpx); apply it to any new subprocess in those paths.
+  (claude, codex, pi, copilot, acpx); apply it to any new subprocess in those paths.
 - Use derived contexts and timeouts for cleanup and HTTP calls.
 - Use `context.Background()` mainly at top-level boundaries, background tasks, or in tests.
 - Protect shared mutable state with `sync.Mutex`, `sync.RWMutex`, `sync.Map`, or `atomic` where appropriate.
@@ -139,6 +139,14 @@ Safest local verification sequence after non-trivial changes:
 - Invariant: `awaiting_agent_since` is non-nil **iff a step is actually parked** at an `awaiting_approval`/`fix_review` gate. The executor (`internal/pipeline/executor.go`) sets it via `db.SetRunAwaitingAgent` on gate entry (right before the step status flips to the gate state, so it is already set once pollers observe the gate) and clears it via `db.ClearRunAwaitingAgent` the moment `waitForApproval` returns - covering both the agent's `axi respond` and a cancel. `RecoverStaleRuns` also clears it so a crash-recovered (failed) run is never reported as parked.
 - Surface: the `run:` TOON object adds `awaiting_agent: parked <duration>` right after `status`, rendered only while `AwaitingAgentSince != nil` and the run is non-terminal (`internal/cli/axi_render.go` `runObjectFieldWithKey` + `formatParkedFor`). The render clock is the injectable `nowUnix` package var so parked-duration tests are deterministic.
 - Tests: db set/clear + recovery (`internal/db/run_test.go`), executor flips-on-gate/clears-on-respond (`internal/pipeline/executor_approval_test.go`), formatter + render shape (`internal/cli/axi_test.go`), and e2e `TestAxiParkedAwaitingAgentSignal`.
+
+**Rebase Base & Force-Push Safety (data-loss prevention)**
+
+- The whole job of this tool is to not lose people's code. Two invariants protect the rebase/push path; favor failing safe (refuse the push, surface a finding) over any clever recovery.
+- **Rebase base comes from the freshly-fetched authoritative remote, never local/stale state.** The rebase step (`internal/pipeline/steps/rebase.go`) fetches `origin/<default>` and `origin/<branch>` (or the fork tracking ref) and rebases onto those remote-tracking refs - never the local default branch.
+- **A gated branch must not silently bundle the contributor's unpushed local-default-branch commits.** `detectBundledLocalDefaultCommits` reads the working repo's local `<default>` tip (`Repo.WorkingPath`), and when that tip is ahead of `origin/<default>` **and** is an ancestor of the branch HEAD (i.e. the branch was built on unpushed default-branch work), the step returns `NeedsApproval` + `AutoFixable=false` so a human decides instead of widening the PR. Detection is best-effort: if the local default advanced past the branch point, or the working repo can't be read, it returns nil and the run proceeds. Regression: `TestRebaseStep_DetectsUnpushedLocalDefaultBranchCommits` (#283).
+- **Every force-push is lease-guarded against discarding unseen upstream commits.** All force-push sites (`PushStep` in `push.go`, CI auto-fix `pushUpdatedHeadSHA` in `ci_fix.go`) route through `resolveForcePushDecision` (`internal/pipeline/steps/forcepush.go`). It re-reads the live remote head and allows the push only when: the branch is new; the remote already equals the head; the remote still equals `lastSeenSHA` (what the run last observed); or every commit now on the remote is already incorporated **by patch-id** (`git rev-list --cherry-pick --right-only HEAD...current`), excluding history the run is knowingly rewriting (`^baseSHA`, i.e. reachable from the run base - the common amend or reverting the pipeline's own autofix). Anything else returns `forcePushWouldDiscardError` and the caller must NOT push. An out-of-band commit reaches the branch *after* the run base, so it is never an ancestor of `baseSHA` and stays flagged.
+- **`lastSeenSHA` must stay the head the run last *observed*, never the live remote tip.** The push step passes the remote-tracking ref the rebase step synced (`lastFetchedBranchTip`); the CI step passes `Run.HeadSHA`. Both callers also pass `Run.BaseSHA` for the `^baseSHA` exclusion. Critically, **the rebase step refreshes `origin/<branch>` only on a normal push, NOT on a force push** - on a force push it skips both the rebase-onto and the fetch, so the tracking ref stays the last-observed head. If it refreshed on a force push, `lastSeenSHA` would equal the live tip, the `current == lastSeenSHA` fast path would pass without the content check, and an out-of-band commit on the branch would be silently clobbered. Anchoring the lease to a SHA read from the remote *immediately before pushing* is the original #281 bug (it always passes and protects nothing); making the rebase always-fetch the branch was the same bug re-created for the force-push path. Never reintroduce either, and never degrade to a bare `--force`/`--force-with-lease` without an explicit anchor when ls-remote/fetch fails (fail closed instead). Regressions: `TestCIStep_CommitAndPush_RefusesToClobberUnseenUpstreamCommit` (#281), `TestPushStep_RefusesToClobberAdvancedUpstreamBranch` (#305), `TestForcePushRun_RefusesToClobberOutOfBandBranchCommit` (force-push fast-path clobber), and `TestResolveForcePushDecision_*`.
 
 **When Making Changes**
 
