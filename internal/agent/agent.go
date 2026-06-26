@@ -25,6 +25,7 @@ type RunOpts struct {
 	CWD        string
 	JSONSchema json.RawMessage   // structured output schema (optional)
 	OnChunk    func(text string) // streaming text callback (optional)
+	Model      string            // optional per-step model override (opencode info.model)
 }
 
 // Result holds the output of an agent invocation.

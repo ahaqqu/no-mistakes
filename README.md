@@ -102,6 +102,25 @@ Once every check is green, the gate forwards your branch to the configured push 
 Prefer to let your coding agent drive the same flow headlessly?
 Use `/no-mistakes` (see below).
 
+## Per-step model overrides
+
+Override the model used by OpenCode (or other agents) for specific pipeline steps.
+Set `agent_model` in `~/.no-mistakes/config.yaml` (global) or `.no-mistakes.yaml` (per-repo);
+repo values override global at the per-agent-per-step level.
+
+```yaml
+agent_model:
+  opencode:
+    review:   "github-copilot/claude-sonnet-4.6"
+    document: "github-copilot/claude-sonnet-4.6"
+    test:     "opencode/gpt-5.1"
+```
+
+The first-level key is the agent name (`opencode`, `claude`, `codex`, etc.),
+the second-level keys are pipeline step names (`review`, `document`, `test`).
+When the pipeline runs a step for the configured agent, the model string is sent
+as `info.model` in the agent request.
+
 ## Three ways to trigger the gate
 
 Every change runs through the same pipeline. Pick the entry point that fits how you're working when the change is ready:
@@ -131,6 +150,16 @@ make docs    # Build the Astro docs site in docs/dist
 See `Makefile` for the full target list.
 
 `make e2e-record` overwrites `internal/e2e/fixtures/` from the real `claude`, `codex`, and `opencode` CLIs, spends real API quota, and should be reviewed before committing.
+
+### Local install
+
+```sh
+./scripts/install-local.sh
+```
+
+Builds from the current checkout and installs the binary to `~/.no-mistakes/bin/no-mistakes`
+(the target that `/usr/local/bin/no-mistakes` symlinks to). Existing binary is backed up
+as `no-mistakes.bak` in the same directory.
 
 ## Star History
 

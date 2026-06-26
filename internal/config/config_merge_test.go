@@ -152,6 +152,57 @@ func TestMerge_AutoFixRepoOverridesGlobal(t *testing.T) {
 	}
 }
 
+func TestMerge_AgentModel(t *testing.T) {
+	t.Run("global only", func(t *testing.T) {
+		global := &GlobalConfig{
+			Agent:      types.AgentClaude,
+			CITimeout:  4 * time.Hour,
+			LogLevel:   "info",
+			AgentModel: map[string]map[string]string{"opencode": {"review": "m1"}},
+		}
+		cfg := Merge(global, &RepoConfig{})
+		if cfg.AgentModel == nil {
+			t.Fatal("agent_model should be present")
+		}
+		if cfg.AgentModel["opencode"]["review"] != "m1" {
+			t.Errorf("review model = %q", cfg.AgentModel["opencode"]["review"])
+		}
+	})
+	t.Run("repo overrides global", func(t *testing.T) {
+		global := &GlobalConfig{
+			Agent:      types.AgentOpenCode,
+			CITimeout:  4 * time.Hour,
+			LogLevel:   "info",
+			AgentModel: map[string]map[string]string{"opencode": {"review": "global-model"}},
+		}
+		repo := &RepoConfig{
+			AgentModel: map[string]map[string]string{"opencode": {"review": "repo-model"}},
+		}
+		cfg := Merge(global, repo)
+		if cfg.AgentModel["opencode"]["review"] != "repo-model" {
+			t.Errorf("review model = %q, want repo-model", cfg.AgentModel["opencode"]["review"])
+		}
+	})
+	t.Run("repo adds new agent key", func(t *testing.T) {
+		global := &GlobalConfig{
+			Agent:      types.AgentOpenCode,
+			CITimeout:  4 * time.Hour,
+			LogLevel:   "info",
+			AgentModel: map[string]map[string]string{"opencode": {"review": "m1"}},
+		}
+		repo := &RepoConfig{
+			AgentModel: map[string]map[string]string{"codex": {"test": "m2"}},
+		}
+		cfg := Merge(global, repo)
+		if cfg.AgentModel["opencode"]["review"] != "m1" {
+			t.Errorf("opencode.review = %q", cfg.AgentModel["opencode"]["review"])
+		}
+		if cfg.AgentModel["codex"]["test"] != "m2" {
+			t.Errorf("codex.test = %q", cfg.AgentModel["codex"]["test"])
+		}
+	})
+}
+
 func TestAutoFixLimit(t *testing.T) {
 	cfg := &Config{
 		AutoFix: AutoFix{Lint: 5, Test: 2, Review: 0, Document: 1, CI: 3, Rebase: 4},

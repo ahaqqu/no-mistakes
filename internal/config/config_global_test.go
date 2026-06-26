@@ -376,6 +376,41 @@ func TestLoadGlobal_AutoFixFromFile(t *testing.T) {
 	}
 }
 
+func TestLoadGlobal_AgentModel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	data := `agent_model:
+  opencode:
+    review: "github-copilot/claude-sonnet-4.6"
+    document: "github-copilot/claude-sonnet-4.6"
+    test: "opencode/gpt-5.1"
+`
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadGlobal(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AgentModel == nil {
+		t.Fatal("agent_model should be loaded")
+	}
+	opencode, ok := cfg.AgentModel["opencode"]
+	if !ok {
+		t.Fatal("expected opencode key in agent_model")
+	}
+	if opencode["review"] != "github-copilot/claude-sonnet-4.6" {
+		t.Errorf("review model = %q", opencode["review"])
+	}
+	if opencode["document"] != "github-copilot/claude-sonnet-4.6" {
+		t.Errorf("document model = %q", opencode["document"])
+	}
+	if opencode["test"] != "opencode/gpt-5.1" {
+		t.Errorf("test model = %q", opencode["test"])
+	}
+}
+
 func TestLoadGlobal_AutoFixPartial(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
