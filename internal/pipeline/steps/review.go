@@ -30,6 +30,8 @@ func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 		reviewScope = fmt.Sprintf("current worktree and HEAD changes relative to base commit %s (starting head %s)", baseSHA, sctx.Run.HeadSHA)
 	}
 
+	model := lookupAgentModel(sctx.Config, string(types.StepReview))
+
 	// In fix mode, ask the agent to fix issues first
 	var fixSummary string
 	if sctx.Fixing {
@@ -77,6 +79,7 @@ Previous review findings to address:
 			Prompt:                  fixPrompt,
 			ErrorPrefix:             "agent fix",
 			FallbackSummary:         "address review findings",
+			Model:                   model,
 		})
 		if err != nil {
 			return nil, err
@@ -184,6 +187,7 @@ Risk assessment (after listing all findings):
 		CWD:        sctx.WorkDir,
 		JSONSchema: reviewFindingsSchema,
 		OnChunk:    sctx.LogChunk,
+		Model:      model,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("agent review: %w", err)

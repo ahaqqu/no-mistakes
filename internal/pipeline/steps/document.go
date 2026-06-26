@@ -37,6 +37,8 @@ func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcom
 
 	sctx.Log("updating documentation...")
 
+	model := lookupAgentModel(sctx.Config, string(types.StepDocument))
+
 	historySection := executionContextPromptSection() + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx)
 	prompt := fmt.Sprintf(
 		`Bring the project documentation fully in sync with the code changes. Discover every documentation gap, fix all of them yourself, verify your edits, and report only what you could not resolve.
@@ -96,6 +98,7 @@ Previous documentation findings to address:
 		CWD:        sctx.WorkDir,
 		JSONSchema: findingsSchema,
 		OnChunk:    sctx.LogChunk,
+		Model:      model,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("agent document: %w", err)
