@@ -5,32 +5,14 @@ import (
 	"testing"
 )
 
-func TestUpdateCommandDevBuild(t *testing.T) {
-	out, err := executeCmd("update")
-	if err != nil {
-		t.Fatalf("update failed: %v\noutput: %s", err, out)
+func TestUpdateCommandNoRepoDir(t *testing.T) {
+	_, err := executeCmd("update")
+	if err == nil {
+		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(out, "self-update unavailable for development builds") {
-		t.Fatalf("unexpected update output: %s", out)
-	}
-}
-
-func TestUpdateCommandBetaFlag(t *testing.T) {
-	out, err := executeCmd("update", "--beta")
-	if err != nil {
-		t.Fatalf("update --beta failed: %v\noutput: %s", err, out)
-	}
-	if !strings.Contains(out, "self-update unavailable for development builds") {
-		t.Fatalf("unexpected update output: %s", out)
-	}
-}
-
-func TestUpdateCommandYesFlag(t *testing.T) {
-	out, err := executeCmd("update", "-y")
-	if err != nil {
-		t.Fatalf("update -y failed: %v\noutput: %s", err, out)
-	}
-	if !strings.Contains(out, "self-update unavailable for development builds") {
-		t.Fatalf("unexpected update output: %s", out)
+	msg := err.Error()
+	if !strings.Contains(msg, "cannot find repo directory") &&
+		!strings.Contains(msg, "NM_REPO_DIR") {
+		t.Fatalf("expected repo-dir error, got: %s", msg)
 	}
 }
