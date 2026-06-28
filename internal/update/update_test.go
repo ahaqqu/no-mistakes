@@ -3,21 +3,15 @@ package update
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/kunchenguid/no-mistakes/internal/db"
-	"github.com/kunchenguid/no-mistakes/internal/paths"
-	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 func TestUpdaterCheckLatestAndRefreshCache(t *testing.T) {
@@ -93,114 +87,43 @@ func TestUpdaterCheckLatestAndRefreshCache(t *testing.T) {
 	}
 }
 
-func TestUpdaterRunReplacesExecutable(t *testing.T) {
-	allowInsecureDownloads = true
-	t.Cleanup(func() { allowInsecureDownloads = false })
-
-	archiveName := "no-mistakes-v1.2.3-darwin-arm64.tar.gz"
-	archive := makeTarGz(t, map[string][]byte{
-		"bin/no-mistakes": []byte("new-binary"),
-	})
-	sum := sha256.Sum256(archive)
-	checksums := fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), archiveName)
-
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
-				archiveName,
-				server.URL+"/archive",
-				server.URL+"/checksums",
-			)
-		case "/archive":
-			w.Write(archive)
-		case "/checksums":
-			fmt.Fprint(w, checksums)
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	execPath := filepath.Join(t.TempDir(), "no-mistakes")
-	if err := os.WriteFile(execPath, []byte("old-binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	stdout := new(bytes.Buffer)
+func TestUpdaterRunNoRepoDir(t *testing.T) {
 	u := &updater{
-		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
 		currentVersion: "v1.2.2",
-		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
-		httpClient:     server.Client(),
-		executablePath: execPath,
-		stdout:         stdout,
-		now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
 	}
-
-	if err := u.run(context.Background()); err != nil {
-		t.Fatalf("run error = %v", err)
+	err := u.run(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
 	}
-	content, err := os.ReadFile(execPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(content) != "new-binary" {
-		t.Fatalf("executable content = %q", string(content))
-	}
-	if !strings.Contains(stdout.String(), "updated no-mistakes") {
-		t.Fatalf("stdout = %q", stdout.String())
+	if !strings.Contains(err.Error(), "cannot find repo directory") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
-func TestUpdaterRunResetsDaemonAfterUpdate(t *testing.T) {
-	allowInsecureDownloads = true
-	t.Cleanup(func() { allowInsecureDownloads = false })
+func TestUpdaterRunAlreadyUpToDate(t *testing.T) {
+	repoDir := t.TempDir()
+	upstreamDir := filepath.Join(t.TempDir(), "upstream.git")
+	originDir := filepath.Join(t.TempDir(), "origin.git")
 
-	archiveName := "no-mistakes-v1.2.3-darwin-arm64.tar.gz"
-	archive := makeTarGz(t, map[string][]byte{
-		"bin/no-mistakes": []byte("new-binary"),
-	})
-	sum := sha256.Sum256(archive)
-	checksums := fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), archiveName)
+	runGitCmd(repoDir, "init", "-b", "main")
+	runGitCmd(repoDir, "config", "user.email", "test@test.com")
+	runGitCmd(repoDir, "config", "user.name", "Test")
+	runGitCmd(repoDir, "commit", "--allow-empty", "-m", "initial")
 
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
-				archiveName,
-				server.URL+"/archive",
-				server.URL+"/checksums",
-			)
-		case "/archive":
-			w.Write(archive)
-		case "/checksums":
-			fmt.Fprint(w, checksums)
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
+	runGitCmd("", "init", "--bare", "-b", "main", upstreamDir)
+	runGitCmd("", "init", "--bare", "-b", "main", originDir)
+	runGitCmd(repoDir, "remote", "add", "upstream", upstreamDir)
+	runGitCmd(repoDir, "remote", "add", "origin", originDir)
+	runGitCmd(repoDir, "push", "-u", "upstream", "main")
+	runGitCmd(repoDir, "push", "-u", "origin", "main")
 
-	execPath := filepath.Join(t.TempDir(), "no-mistakes")
-	if err := os.WriteFile(execPath, []byte("old-binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
+	stdout := new(bytes.Buffer)
 	resetCalled := false
 	u := &updater{
-		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
-		currentVersion: "v1.2.2",
-		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
-		httpClient:     server.Client(),
-		executablePath: execPath,
-		now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
+		appName:  "no-mistakes",
+		repoDir:  repoDir,
+		stdout:   stdout,
+		stdin:    os.Stdin,
 		resetDaemon: func() error {
 			resetCalled = true
 			return nil
@@ -209,629 +132,148 @@ func TestUpdaterRunResetsDaemonAfterUpdate(t *testing.T) {
 
 	if err := u.run(context.Background()); err != nil {
 		t.Fatalf("run error = %v", err)
-	}
-	if !resetCalled {
-		t.Fatal("expected daemon reset after successful update")
-	}
-}
-
-func TestUpdaterRunWarnsAndRequiresConfirmationForActiveRuns(t *testing.T) {
-	allowInsecureDownloads = true
-	t.Cleanup(func() { allowInsecureDownloads = false })
-
-	archiveName := "no-mistakes-v1.2.3-darwin-arm64.tar.gz"
-	archive := makeTarGz(t, map[string][]byte{
-		"bin/no-mistakes": []byte("new-binary"),
-	})
-	sum := sha256.Sum256(archive)
-	checksums := fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), archiveName)
-
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
-				archiveName,
-				server.URL+"/archive",
-				server.URL+"/checksums",
-			)
-		case "/archive":
-			w.Write(archive)
-		case "/checksums":
-			fmt.Fprint(w, checksums)
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	p := paths.WithRoot(t.TempDir())
-	if err := p.EnsureDirs(); err != nil {
-		t.Fatalf("ensure paths: %v", err)
-	}
-	database, err := db.Open(p.DB())
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	repo, err := database.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
-	if err != nil {
-		t.Fatalf("insert repo: %v", err)
-	}
-	pendingRun, err := database.InsertRun(repo.ID, "feature-a", "aaa111", "000")
-	if err != nil {
-		t.Fatalf("insert pending run: %v", err)
-	}
-	runningRun, err := database.InsertRun(repo.ID, "feature-b", "bbb222", "000")
-	if err != nil {
-		t.Fatalf("insert running run: %v", err)
-	}
-	if err := database.UpdateRunStatus(runningRun.ID, types.RunRunning); err != nil {
-		t.Fatalf("mark running: %v", err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatalf("close db: %v", err)
-	}
-
-	execPath := filepath.Join(t.TempDir(), "no-mistakes")
-	if err := os.WriteFile(execPath, []byte("old-binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	stdout := new(bytes.Buffer)
-	stderr := new(bytes.Buffer)
-	resetCalled := false
-	u := &updater{
-		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
-		currentVersion: "v1.2.2",
-		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
-		httpClient:     server.Client(),
-		executablePath: execPath,
-		stdout:         stdout,
-		stderr:         stderr,
-		stdin:          strings.NewReader("n\n"),
-		now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
-		resetDaemon: func() error {
-			resetCalled = true
-			return nil
-		},
-		paths: p,
-	}
-
-	err = u.run(context.Background())
-	if err == nil {
-		t.Fatal("run should fail when active run warning is rejected")
-	}
-	if !strings.Contains(err.Error(), "active pipeline runs") {
-		t.Fatalf("run error = %v", err)
-	}
-	transcript := stderr.String()
-	for _, want := range []string{
-		"2 active pipeline runs",
-		pendingRun.ID,
-		"feature-a",
-		runningRun.ID,
-		"feature-b",
-		"Continue with update and restart the daemon? [y/N]",
-	} {
-		if !strings.Contains(transcript, want) {
-			t.Fatalf("stderr should contain %q, got %q", want, transcript)
-		}
-	}
-	content, readErr := os.ReadFile(execPath)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if string(content) != "old-binary" {
-		t.Fatalf("executable content = %q", string(content))
-	}
-	if resetCalled {
-		t.Fatal("reset daemon should not run after rejecting active run warning")
-	}
-	if stdout.Len() != 0 {
-		t.Fatalf("stdout = %q", stdout.String())
-	}
-}
-
-func TestUpdaterRunFailsWhenDaemonResetFails(t *testing.T) {
-	allowInsecureDownloads = true
-	t.Cleanup(func() { allowInsecureDownloads = false })
-
-	archiveName := "no-mistakes-v1.2.3-darwin-arm64.tar.gz"
-	archive := makeTarGz(t, map[string][]byte{
-		"bin/no-mistakes": []byte("new-binary"),
-	})
-	sum := sha256.Sum256(archive)
-	checksums := fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), archiveName)
-
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
-				archiveName,
-				server.URL+"/archive",
-				server.URL+"/checksums",
-			)
-		case "/archive":
-			w.Write(archive)
-		case "/checksums":
-			fmt.Fprint(w, checksums)
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	execPath := filepath.Join(t.TempDir(), "no-mistakes")
-	if err := os.WriteFile(execPath, []byte("old-binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	stdout := new(bytes.Buffer)
-	stderr := new(bytes.Buffer)
-	u := &updater{
-		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
-		currentVersion: "v1.2.2",
-		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
-		httpClient:     server.Client(),
-		executablePath: execPath,
-		stdout:         stdout,
-		stderr:         stderr,
-		now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
-		resetDaemon: func() error {
-			return fmt.Errorf("boom")
-		},
-	}
-
-	err := u.run(context.Background())
-	if err == nil {
-		t.Fatal("run should fail when daemon reset fails")
-	}
-	if !strings.Contains(err.Error(), "failed to reset daemon") {
-		t.Fatalf("run error = %v", err)
-	}
-	content, err := os.ReadFile(execPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(content) != "new-binary" {
-		t.Fatalf("executable content = %q", string(content))
-	}
-	if stdout.Len() != 0 {
-		t.Fatalf("stdout = %q", stdout.String())
-	}
-	if stderr.Len() != 0 {
-		t.Fatalf("stderr = %q", stderr.String())
-	}
-}
-
-func TestUpdaterRunFailsWhenDaemonResetLeavesDaemonOffline(t *testing.T) {
-	allowInsecureDownloads = true
-	t.Cleanup(func() { allowInsecureDownloads = false })
-
-	archiveName := "no-mistakes-v1.2.3-darwin-arm64.tar.gz"
-	archive := makeTarGz(t, map[string][]byte{
-		"bin/no-mistakes": []byte("new-binary"),
-	})
-	sum := sha256.Sum256(archive)
-	checksums := fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), archiveName)
-
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
-				archiveName,
-				server.URL+"/archive",
-				server.URL+"/checksums",
-			)
-		case "/archive":
-			w.Write(archive)
-		case "/checksums":
-			fmt.Fprint(w, checksums)
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	execPath := filepath.Join(t.TempDir(), "no-mistakes")
-	if err := os.WriteFile(execPath, []byte("old-binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	stdout := new(bytes.Buffer)
-	u := &updater{
-		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
-		currentVersion: "v1.2.2",
-		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
-		httpClient:     server.Client(),
-		executablePath: execPath,
-		stdout:         stdout,
-		now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
-		resetDaemon: func() error {
-			return &daemonResetError{err: errors.New("start daemon: boom"), daemonOffline: true}
-		},
-	}
-
-	err := u.run(context.Background())
-	if err == nil {
-		t.Fatal("run should fail when daemon reset leaves daemon offline")
-	}
-	if !strings.Contains(err.Error(), "daemon is offline") {
-		t.Fatalf("run error = %v", err)
-	}
-	content, readErr := os.ReadFile(execPath)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if string(content) != "new-binary" {
-		t.Fatalf("executable content = %q", string(content))
-	}
-	if stdout.Len() != 0 {
-		t.Fatalf("stdout = %q", stdout.String())
-	}
-}
-
-func TestUpdaterRunFailsWhenDaemonUsesDifferentExecutable(t *testing.T) {
-	allowInsecureDownloads = true
-	t.Cleanup(func() { allowInsecureDownloads = false })
-
-	archiveName := "no-mistakes-v1.2.3-darwin-arm64.tar.gz"
-	archive := makeTarGz(t, map[string][]byte{
-		"bin/no-mistakes": []byte("new-binary"),
-	})
-	sum := sha256.Sum256(archive)
-	checksums := fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), archiveName)
-
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
-				archiveName,
-				server.URL+"/archive",
-				server.URL+"/checksums",
-			)
-		case "/archive":
-			w.Write(archive)
-		case "/checksums":
-			fmt.Fprint(w, checksums)
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	execDir := t.TempDir()
-	execPath := filepath.Join(execDir, "no-mistakes")
-	if err := os.WriteFile(execPath, []byte("old-binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	otherExecPath := filepath.Join(execDir, "other-no-mistakes")
-	if err := os.WriteFile(otherExecPath, []byte("other-binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	origDaemonIsRunning := daemonIsRunning
-	origDaemonExecutablePath := daemonExecutablePath
-	t.Cleanup(func() {
-		daemonIsRunning = origDaemonIsRunning
-		daemonExecutablePath = origDaemonExecutablePath
-	})
-
-	checks := 0
-	daemonIsRunning = func(*paths.Paths) (bool, error) {
-		checks++
-		return true, nil
-	}
-	daemonExecutablePath = func(*paths.Paths) (string, error) {
-		return otherExecPath, nil
-	}
-
-	resetCalled := false
-	u := &updater{
-		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
-		currentVersion: "v1.2.2",
-		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
-		httpClient:     server.Client(),
-		executablePath: execPath,
-		now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
-		resetDaemon: func() error {
-			resetCalled = true
-			return nil
-		},
-		paths: paths.WithRoot(t.TempDir()),
-	}
-
-	err := u.run(context.Background())
-	if err == nil {
-		t.Fatal("run should fail when daemon uses a different executable")
-	}
-	if !strings.Contains(err.Error(), "daemon is running from") {
-		t.Fatalf("run error = %v", err)
-	}
-	if checks == 0 {
-		t.Fatal("expected daemon health check before update")
-	}
-	if resetCalled {
-		t.Fatal("reset daemon should not run when executables mismatch")
-	}
-	content, readErr := os.ReadFile(execPath)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if string(content) != "old-binary" {
-		t.Fatalf("executable content = %q", string(content))
-	}
-}
-
-func TestUpdaterRunReplacesDaemonWhenDifferentExecutableConfirmed(t *testing.T) {
-	allowInsecureDownloads = true
-	t.Cleanup(func() { allowInsecureDownloads = false })
-
-	archiveName := "no-mistakes-v1.2.3-darwin-arm64.tar.gz"
-	archive := makeTarGz(t, map[string][]byte{
-		"bin/no-mistakes": []byte("new-binary"),
-	})
-	sum := sha256.Sum256(archive)
-	checksums := fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), archiveName)
-
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
-				archiveName,
-				server.URL+"/archive",
-				server.URL+"/checksums",
-			)
-		case "/archive":
-			w.Write(archive)
-		case "/checksums":
-			fmt.Fprint(w, checksums)
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	origDaemonIsRunning := daemonIsRunning
-	origDaemonExecutablePath := daemonExecutablePath
-	t.Cleanup(func() {
-		daemonIsRunning = origDaemonIsRunning
-		daemonExecutablePath = origDaemonExecutablePath
-	})
-
-	tests := []struct {
-		name      string
-		stdin     string
-		assumeYes bool
-		want      string
-	}{
-		{name: "prompt", stdin: "y\n", want: "Replace the running daemon"},
-		{name: "assume yes", assumeYes: true, want: "-y was provided"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			execDir := t.TempDir()
-			execPath := filepath.Join(execDir, "no-mistakes")
-			if err := os.WriteFile(execPath, []byte("old-binary"), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			otherExecPath := filepath.Join(execDir, "other-no-mistakes")
-			if err := os.WriteFile(otherExecPath, []byte("other-binary"), 0o755); err != nil {
-				t.Fatal(err)
-			}
-
-			daemonIsRunning = func(*paths.Paths) (bool, error) {
-				return true, nil
-			}
-			daemonExecutablePath = func(*paths.Paths) (string, error) {
-				return otherExecPath, nil
-			}
-
-			resetCalled := false
-			stdout := new(bytes.Buffer)
-			stderr := new(bytes.Buffer)
-			u := &updater{
-				appName:        "no-mistakes",
-				repo:           "kunchenguid/no-mistakes",
-				currentVersion: "v1.2.2",
-				platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-				apiBaseURL:     server.URL,
-				httpClient:     server.Client(),
-				executablePath: execPath,
-				stdout:         stdout,
-				stderr:         stderr,
-				stdin:          strings.NewReader(tt.stdin),
-				now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
-				resetDaemon: func() error {
-					resetCalled = true
-					return nil
-				},
-				paths:     paths.WithRoot(t.TempDir()),
-				assumeYes: tt.assumeYes,
-			}
-
-			if err := u.run(context.Background()); err != nil {
-				t.Fatalf("run error = %v", err)
-			}
-			if !resetCalled {
-				t.Fatal("expected daemon reset after confirming executable takeover")
-			}
-			content, readErr := os.ReadFile(execPath)
-			if readErr != nil {
-				t.Fatal(readErr)
-			}
-			if string(content) != "new-binary" {
-				t.Fatalf("executable content = %q", string(content))
-			}
-			if !strings.Contains(stdout.String(), "updated no-mistakes from v1.2.2 to v1.2.3") {
-				t.Fatalf("stdout should report successful update, got %q", stdout.String())
-			}
-			for _, want := range []string{resolveExecutablePath(otherExecPath), resolveExecutablePath(execPath), tt.want} {
-				if !strings.Contains(stderr.String(), want) {
-					t.Fatalf("stderr should contain %q, got %q", want, stderr.String())
-				}
-			}
-			t.Logf("stderr transcript:\n%s", stderr.String())
-			t.Logf("stdout transcript:\n%s", stdout.String())
-		})
-	}
-}
-
-func TestUpdaterRunFailsWhenDaemonExecutableCannotBeResolved(t *testing.T) {
-	allowInsecureDownloads = true
-	t.Cleanup(func() { allowInsecureDownloads = false })
-
-	archiveName := "no-mistakes-v1.2.3-darwin-arm64.tar.gz"
-	archive := makeTarGz(t, map[string][]byte{
-		"bin/no-mistakes": []byte("new-binary"),
-	})
-	sum := sha256.Sum256(archive)
-	checksums := fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), archiveName)
-
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
-				archiveName,
-				server.URL+"/archive",
-				server.URL+"/checksums",
-			)
-		case "/archive":
-			w.Write(archive)
-		case "/checksums":
-			fmt.Fprint(w, checksums)
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	execDir := t.TempDir()
-	execPath := filepath.Join(execDir, "no-mistakes")
-	if err := os.WriteFile(execPath, []byte("old-binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	origDaemonIsRunning := daemonIsRunning
-	origDaemonExecutablePath := daemonExecutablePath
-	t.Cleanup(func() {
-		daemonIsRunning = origDaemonIsRunning
-		daemonExecutablePath = origDaemonExecutablePath
-	})
-
-	checks := 0
-	daemonIsRunning = func(*paths.Paths) (bool, error) {
-		checks++
-		return true, nil
-	}
-	daemonExecutablePath = func(*paths.Paths) (string, error) {
-		return "", errors.New("pid lookup failed")
-	}
-
-	resetCalled := false
-	u := &updater{
-		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
-		currentVersion: "v1.2.2",
-		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
-		httpClient:     server.Client(),
-		executablePath: execPath,
-		now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
-		resetDaemon: func() error {
-			resetCalled = true
-			return nil
-		},
-		paths: paths.WithRoot(t.TempDir()),
-	}
-
-	err := u.run(context.Background())
-	if err == nil {
-		t.Fatal("run should fail when daemon executable cannot be resolved")
-	}
-	if !strings.Contains(err.Error(), "cannot determine daemon executable path") {
-		t.Fatalf("run error = %v", err)
-	}
-	if checks == 0 {
-		t.Fatal("expected daemon health check before update")
-	}
-	if resetCalled {
-		t.Fatal("reset daemon should not run when daemon executable cannot be resolved")
-	}
-}
-
-func TestUpdaterRunSkipsDaemonExecutableCheckWhenAlreadyUpToDate(t *testing.T) {
-	allowInsecureDownloads = true
-	t.Cleanup(func() { allowInsecureDownloads = false })
-
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/kunchenguid/no-mistakes/releases/latest":
-			fmt.Fprint(w, `{"tag_name":"v1.2.2","assets":[]}`)
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	execPath := filepath.Join(t.TempDir(), "no-mistakes")
-	if err := os.WriteFile(execPath, []byte("current-binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	origDaemonIsRunning := daemonIsRunning
-	origDaemonExecutablePath := daemonExecutablePath
-	t.Cleanup(func() {
-		daemonIsRunning = origDaemonIsRunning
-		daemonExecutablePath = origDaemonExecutablePath
-	})
-
-	checks := 0
-	daemonIsRunning = func(*paths.Paths) (bool, error) {
-		checks++
-		return true, nil
-	}
-	daemonExecutablePath = func(*paths.Paths) (string, error) {
-		return "", errors.New("pid lookup failed")
-	}
-
-	stdout := new(bytes.Buffer)
-	u := &updater{
-		appName:        "no-mistakes",
-		repo:           "kunchenguid/no-mistakes",
-		currentVersion: "v1.2.2",
-		platform:       platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-		apiBaseURL:     server.URL,
-		httpClient:     server.Client(),
-		executablePath: execPath,
-		stdout:         stdout,
-		now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
-		paths:          paths.WithRoot(t.TempDir()),
-	}
-
-	if err := u.run(context.Background()); err != nil {
-		t.Fatalf("run error = %v", err)
-	}
-	if checks != 0 {
-		t.Fatalf("expected no daemon executable check when already up to date, got %d checks", checks)
 	}
 	if !strings.Contains(stdout.String(), "already up to date") {
 		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if resetCalled {
+		t.Fatal("expected no daemon reset when already up to date")
+	}
+}
+
+func TestUpdaterRunNotOnMainBranch(t *testing.T) {
+	repoDir := t.TempDir()
+	upstreamDir := filepath.Join(t.TempDir(), "upstream.git")
+
+	runGitCmd(repoDir, "init", "-b", "main")
+	runGitCmd(repoDir, "config", "user.email", "test@test.com")
+	runGitCmd(repoDir, "config", "user.name", "Test")
+	runGitCmd(repoDir, "commit", "--allow-empty", "-m", "initial")
+
+	runGitCmd("", "init", "--bare", upstreamDir)
+	runGitCmd(repoDir, "remote", "add", "upstream", upstreamDir)
+	runGitCmd(repoDir, "checkout", "-b", "feature")
+
+	u := &updater{
+		appName:  "no-mistakes",
+		repoDir:  repoDir,
+	}
+
+	err := u.run(context.Background())
+	if err == nil {
+		t.Fatal("expected error for non-main branch")
+	}
+	if !strings.Contains(err.Error(), "switch to main") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestUpdaterRunDirtyWorkingTree(t *testing.T) {
+	repoDir := t.TempDir()
+	upstreamDir := filepath.Join(t.TempDir(), "upstream.git")
+
+	runGitCmd(repoDir, "init", "-b", "main")
+	runGitCmd(repoDir, "config", "user.email", "test@test.com")
+	runGitCmd(repoDir, "config", "user.name", "Test")
+	runGitCmd(repoDir, "commit", "--allow-empty", "-m", "initial")
+
+	runGitCmd("", "init", "--bare", upstreamDir)
+	runGitCmd(repoDir, "remote", "add", "upstream", upstreamDir)
+
+	os.WriteFile(filepath.Join(repoDir, "dirty.txt"), []byte("untracked"), 0o644)
+	runGitCmd(repoDir, "add", "dirty.txt")
+
+	u := &updater{
+		appName:  "no-mistakes",
+		repoDir:  repoDir,
+	}
+
+	err := u.run(context.Background())
+	if err == nil {
+		t.Fatal("expected error for dirty working tree")
+	}
+	if !strings.Contains(err.Error(), "uncommitted changes") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestUpdaterRunRebaseAndInstall(t *testing.T) {
+	repoDir := t.TempDir()
+	upstreamDir := filepath.Join(t.TempDir(), "upstream.git")
+	originDir := filepath.Join(t.TempDir(), "origin.git")
+
+	runGitCmd(repoDir, "init", "-b", "main")
+	runGitCmd(repoDir, "config", "user.email", "test@test.com")
+	runGitCmd(repoDir, "config", "user.name", "Test")
+
+	runGitCmd("", "init", "--bare", "-b", "main", upstreamDir)
+	runGitCmd("", "init", "--bare", "-b", "main", originDir)
+
+	// Create scripts/install-local.sh and commit it as part of the initial commit
+	scriptsDir := filepath.Join(repoDir, "scripts")
+	if err := os.MkdirAll(scriptsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	installScript := filepath.Join(scriptsDir, "install-local.sh")
+	if err := os.WriteFile(installScript, []byte("#!/bin/sh\necho installed"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGitCmd(repoDir, "add", ".")
+	runGitCmd(repoDir, "commit", "-m", "initial")
+
+	runGitCmd(repoDir, "remote", "add", "upstream", upstreamDir)
+	runGitCmd(repoDir, "remote", "add", "origin", originDir)
+	runGitCmd(repoDir, "push", "-u", "upstream", "main")
+	runGitCmd(repoDir, "push", "-u", "origin", "main")
+
+	// Add a custom commit on local
+	os.WriteFile(filepath.Join(repoDir, "local.txt"), []byte("custom"), 0o644)
+	runGitCmd(repoDir, "add", ".")
+	runGitCmd(repoDir, "commit", "-m", "local custom change")
+
+	// Push custom commit to origin (simulate user's fork)
+	runGitCmd(repoDir, "push", "-u", "origin", "main")
+
+	// Now upstream has a new commit: clone, add commit, push back
+	upstreamClone := t.TempDir()
+	runGitCmd(upstreamClone, "clone", "-b", "main", upstreamDir, ".")
+	runGitCmd(upstreamClone, "config", "user.email", "test@test.com")
+	runGitCmd(upstreamClone, "config", "user.name", "Test")
+	os.WriteFile(filepath.Join(upstreamClone, "upstream.txt"), []byte("new"), 0o644)
+	runGitCmd(upstreamClone, "add", ".")
+	runGitCmd(upstreamClone, "commit", "-m", "upstream change")
+	runGitCmd(upstreamClone, "push")
+
+	stdout := new(bytes.Buffer)
+	resetCalled := false
+	u := &updater{
+		appName:  "no-mistakes",
+		repoDir:  repoDir,
+		stdout:   stdout,
+		stdin:    os.Stdin,
+		resetDaemon: func() error {
+			resetCalled = true
+			return nil
+		},
+	}
+
+	if err := u.run(context.Background()); err != nil {
+		t.Fatalf("run error = %v", err)
+	}
+	if !strings.Contains(stdout.String(), "updated to latest upstream") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if !resetCalled {
+		t.Fatal("expected daemon reset after update")
+	}
+
+	// Verify custom commit is on top after rebase
+	log, err := u.gitOutput(repoDir, "log", "--oneline", "-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(log, "local custom change") {
+		t.Fatalf("expected custom commit on top, got:\n%s", log)
 	}
 }
 
@@ -1099,5 +541,14 @@ func TestUpdaterCachedLatestVersion(t *testing.T) {
 	u.currentVersion = "v1.2.3"
 	if got := u.cachedLatestVersion(); got != "" {
 		t.Fatalf("cachedLatestVersion() = %q, want empty when already current", got)
+	}
+}
+
+func runGitCmd(dir string, args ...string) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		panic(fmt.Sprintf("git %s in %s: %s\n%s", strings.Join(args, " "), dir, err, string(out)))
 	}
 }
